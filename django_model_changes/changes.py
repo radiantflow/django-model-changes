@@ -268,8 +268,8 @@ class InstanceChanges(object):
             >>> user.was_persisted()
             True
         """
-        pk_name = self.instance._meta.pk.name
-        return bool(self.old_state()[pk_name])
+        pk_attname = self.instance._meta.pk.attname
+        return bool(self.old_state()[pk_attname])
 
     def is_persisted(self):
         """
