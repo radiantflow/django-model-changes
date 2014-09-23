@@ -22,7 +22,7 @@ class ModelChangesRegistry(object):
         self._registry = {}
 
 
-    def register(self, model_or_iterable, **options):
+    def register(self, model_or_iterable, allow_existing=True, **options):
         """
         Registers the given model(s) with the changes manager
 
@@ -40,11 +40,11 @@ class ModelChangesRegistry(object):
                 raise ImproperlyConfigured('The model %s is abstract, so it '
                       'cannot be registered with model changes.' % model.__name__)
 
-            if model in self._registry:
+            if model in self._registry and not allow_existing:
                 raise AlreadyRegistered('The model %s is already registered' % model.__name__)
-
-            # Instantiate the changes class to save in the registry
-            self._registry[model] = ModelChanges(model, self)
+            else:
+                # Instantiate the changes class to save in the registry
+                self._registry[model] = ModelChanges(model, self)
 
     def unregister(self, model_or_iterable):
         """
