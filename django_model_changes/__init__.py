@@ -1,2 +1,2 @@
-from changes import ChangesMixin
+from changes import registry
 from signals import post_change

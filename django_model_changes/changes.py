@@ -1,4 +1,6 @@
 from django.db.models import signals
+from django.db.models.base import ModelBase
+from django.core.exceptions import ImproperlyConfigured
 
 from .signals import post_change
 
@@ -6,9 +8,100 @@ SAVE = 0
 DELETE = 1
 
 
-class ChangesMixin(object):
+class AlreadyRegistered(Exception):
+    pass
+
+
+class NotRegistered(Exception):
+    pass
+
+
+class ModelChangesRegistry(object):
+
+    def __init__(self):
+        self._registry = {}
+
+
+    def register(self, model_or_iterable, **options):
+        """
+        Registers the given model(s) with the changes manager
+
+        The model(s) should be Model classes, not instances.
+
+        If a model is already registered, this will raise AlreadyRegistered.
+
+        If a model is abstract, this will raise ImproperlyConfigured.
+        """
+
+        if isinstance(model_or_iterable, ModelBase):
+            model_or_iterable = [model_or_iterable]
+        for model in model_or_iterable:
+            if model._meta.abstract:
+                raise ImproperlyConfigured('The model %s is abstract, so it '
+                      'cannot be registered with model changes.' % model.__name__)
+
+            if model in self._registry:
+                raise AlreadyRegistered('The model %s is already registered' % model.__name__)
+
+            # Instantiate the changes class to save in the registry
+            self._registry[model] = ModelChanges(model, self)
+
+    def unregister(self, model_or_iterable):
+        """
+        Unregisters the given model(s).
+
+        If a model isn't already registered, this will raise NotRegistered.
+        """
+        if isinstance(model_or_iterable, ModelBase):
+            model_or_iterable = [model_or_iterable]
+        for model in model_or_iterable:
+            if model not in self._registry:
+                raise NotRegistered('The model %s is not registered' % model.__name__)
+            del self._registry[model]
+
+
+class ModelChanges(object):
     """
-    ChangesMixin keeps track of changes for model instances.
+    ModelChanges handles signals for a specified  model
+
+    """
+
+    def __init__(self, model, registry):
+
+        self.model = model
+        self._registry = registry
+
+        signals.post_init.connect(
+            self._post_init, sender=model,
+            dispatch_uid='django-changes-%s' % str(model._meta)
+        )
+        signals.post_save.connect(
+            self._post_save, sender=model,
+            dispatch_uid='django-changes-%s' % str(model._meta)
+        )
+        signals.post_delete.connect(
+            self._post_delete, sender=model,
+            dispatch_uid='django-changes-%s' % str(model._meta)
+        )
+
+
+    def _post_init(self, sender, instance, **kwargs):
+        instance._changes = InstanceChanges(instance, self)
+
+    def _post_save(self, sender, instance, **kwargs):
+        if hasattr(instance, '_changes'):
+            instance._changes._save_state(new_instance=False, event_type=SAVE)
+
+    def _post_delete(self, sender, instance, **kwargs):
+        if hasattr(instance, '_changes'):
+            instance._save_state(new_instance=False, event_type=DELETE)
+
+
+
+
+class InstanceChanges(object):
+    """
+    InstanceChanges keeps track of changes for model instances.
 
     It allows you to retrieve the following states from an instance:
 
@@ -61,26 +154,19 @@ class ChangesMixin(object):
 
     """
 
-    def __init__(self, *args, **kwargs):
-        super(ChangesMixin, self).__init__(*args, **kwargs)
-
+    def __init__(self, instance, model_changes):
+        self.instance = instance
+        self.model_changes = model_changes
+        self.model = model_changes.model
         self._states = []
         self._save_state(new_instance=True)
 
-        signals.post_save.connect(
-            _post_save, sender=self.__class__,
-            dispatch_uid='django-changes-%s' % self.__class__.__name__
-        )
-        signals.post_delete.connect(
-            _post_delete, sender=self.__class__,
-            dispatch_uid='django-changes-%s' % self.__class__.__name__
-        )
 
     def _save_state(self, new_instance=False, event_type='save'):
         # Pipe the pk on deletes so that a correct snapshot of the current
         # state can be taken.
         if event_type == DELETE:
-            self.pk = None
+            self.instance.pk = None
 
         # Save current state.
         self._states.append(self.current_state())
@@ -93,13 +179,13 @@ class ChangesMixin(object):
 
         # Send post_change signal unless this is a new instance
         if not new_instance:
-            post_change.send(sender=self.__class__, instance=self)
+            post_change.send(sender=self.instance.__class__, instance=self.instance, changes=self)
 
     def _instance_from_state(self, state):
         """
         Creates an instance from a previously saved state.
         """
-        instance = self.__class__()
+        instance = self.instance.__class__()
         for key, value in state.items():
             setattr(instance, key, value)
         return instance
@@ -109,17 +195,17 @@ class ChangesMixin(object):
         Returns a ``field -> value`` dict of the current state of the instance.
         """
         fields = {}
-        for field in self._meta.local_fields:
+        for field in self.instance._meta.local_fields:
             # It's always safe to access the field attribute name, it refers to simple types that are immediately
             # available on the instance.
-            fields[field.attname] = getattr(self, field.attname)
+            fields[field.attname] = getattr(self.instance, field.attname)
 
             # Foreign fields require special care because we don't want to trigger a database query when the field is
             # not yet cached.
             if field.rel:
-                descriptor = self.__class__.__dict__[field.name]
-                if hasattr(self, descriptor.cache_name):
-                    fields[field.name] = getattr(self, descriptor.cache_name)
+                descriptor = self.instance.__class__.__dict__[field.name]
+                if hasattr(self.instance, descriptor.cache_name):
+                    fields[field.name] = getattr(self.instance, descriptor.cache_name)
 
         return fields
 
@@ -182,7 +268,7 @@ class ChangesMixin(object):
             >>> user.was_persisted()
             True
         """
-        pk_name = self._meta.pk.name
+        pk_name = self.instance._meta.pk.name
         return bool(self.old_state()[pk_name])
 
     def is_persisted(self):
@@ -202,7 +288,7 @@ class ChangesMixin(object):
             >>> user.is_persisted()
             False
         """
-        return bool(self.pk)
+        return bool(self.instance.pk)
 
     def old_instance(self):
         """
@@ -217,9 +303,4 @@ class ChangesMixin(object):
         return self._instance_from_state(self.previous_state())
 
 
-def _post_save(sender, instance, **kwargs):
-    instance._save_state(new_instance=False, event_type=SAVE)
-
-
-def _post_delete(sender, instance, **kwargs):
-    instance._save_state(new_instance=False, event_type=DELETE)
+registry = ModelChangesRegistry()
